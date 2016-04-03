@@ -1,3 +1,4 @@
+extern crate encoding;
 extern crate mysql;
 extern crate rusqlite;
 
@@ -78,15 +79,73 @@ impl Archiver {
 
 use mysql::value::Value;
 use rusqlite::types::ToSql;
+use encoding::{Encoding, DecoderTrap};
+use encoding::all::WINDOWS_1252;
 
 struct MysqlValue(Value);
+
+enum DecodeState {
+    Char,
+    Backslash,
+    First(u8),
+    Second(u8),
+}
+
+fn parse_octal(c: u8) -> Option<u8> {
+    let ch = c as char;
+    if ch < '0' || ch > '7' {
+        None
+    } else {
+        Some(c - ('0' as u8))
+    }
+}
+
+fn valid_octal_sequence(bytes: &Vec<u8>, pos: usize) -> bool {
+    bytes.len() > pos + 3
+        && bytes[pos] == ('\\' as u8)
+        && parse_octal(bytes[pos + 1]).is_some()
+        && parse_octal(bytes[pos + 2]).is_some()
+        && parse_octal(bytes[pos + 3]).is_some()
+}
+
+// Decodes the league's octal Latin1 escapes, converting to UTF-8.
+// Invalid escapes are left as-is.
+fn decode_bytes(bytes: &Vec<u8>) -> String {
+    // Resolve all octal escapes.
+    let bytes: Vec<u8> = bytes.iter().enumerate().scan(DecodeState::Char, |state, (i, &c)| {
+        let (new_state, out) = match *state {
+            DecodeState::Char => {
+                if valid_octal_sequence(bytes, i) {
+                    (DecodeState::Backslash, None)
+                } else {
+                    (DecodeState::Char, Some(c))
+                }
+            },
+            DecodeState::Backslash => (DecodeState::First(parse_octal(c).unwrap()), None),
+            DecodeState::First(n)  => (DecodeState::Second((n << 3) + parse_octal(c).unwrap()), None),
+            DecodeState::Second(n) => (DecodeState::Char, Some((n << 3) + parse_octal(c).unwrap()))
+        };
+        *state = new_state;
+        Some(out)
+    }).filter_map(|c| c ).collect();
+    WINDOWS_1252.decode(bytes.as_slice(), DecoderTrap::Replace).unwrap()
+}
+
+#[test]
+fn test_decode_bytes() {
+    assert_eq!("Abwärts".to_string(), decode_bytes(&r"Abw\344rts".as_bytes().to_vec()));
+    assert_eq!("Fußball".to_string(), decode_bytes(&r"Fu\337ball".as_bytes().to_vec()));
+    assert_eq!("CrazyElevator 2¾".to_string(), decode_bytes(&r"CrazyElevator 2\276".as_bytes().to_vec()));
+    assert_eq!("\\abc\"".to_string(), decode_bytes(&"\\abc\"".as_bytes().to_vec()));
+    assert_eq!("äöüß".to_string(), decode_bytes(&r"\344\366\374\337".as_bytes().to_vec()));
+}
 
 impl rusqlite::types::ToSql for MysqlValue {
     unsafe fn bind_parameter(&self, stmt: *mut rusqlite::types::sqlite3_stmt, col: c_int) -> c_int {
         let &MysqlValue(ref value) = self;
         match *value {
             Value::NULL => ToSql::bind_parameter(&rusqlite::types::Null, stmt, col),
-            Value::Bytes(ref v) => ToSql::bind_parameter(v, stmt, col),
+            Value::Bytes(ref v) => ToSql::bind_parameter(&decode_bytes(&v), stmt, col),
             Value::Int(ref i) => ToSql::bind_parameter(i, stmt, col),
             // Sqlite doesn't support u64
             Value::UInt(ref i) => ToSql::bind_parameter(&(*i as i64), stmt, col),
